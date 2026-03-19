@@ -99,6 +99,16 @@
   font-weight: 500;
 }
 
+.break-all {
+  word-break: break-all;
+  overflow-wrap: break-word;
+}
+
+.break-all a {
+  word-break: break-all;
+  overflow-wrap: break-word;
+}
+
 .status.idle {
   color: #586273;
 }

@@ -31,6 +31,7 @@ app.use(cors({
 app.use(express.json())
 
 const jobs = new Map()
+const JOB_TTL_MS = 5 * 60 * 1000
 
 const YT_HOSTS = new Set([
     'youtube.com',
@@ -112,11 +113,46 @@ function createJob(url) {
         status: 'queued',
         serverProgress: 0,
         error: null,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        lastAccessedAt: Date.now(),
+        cleanupAt: null,
+        cleanupTimer: null
     }
 
     jobs.set(id, job)
     return job
+}
+
+async function cleanupJob(job) {
+    if (job.cleanupTimer) {
+        clearTimeout(job.cleanupTimer)
+        job.cleanupTimer = null
+    }
+
+    try {
+        await fsp.unlink(job.filePath)
+    } catch {
+        // Ignore missing file and cleanup errors.
+    }
+
+    jobs.delete(job.id)
+}
+
+function scheduleJobCleanup(job, delayMs = JOB_TTL_MS) {
+    if (job.cleanupTimer) {
+        clearTimeout(job.cleanupTimer)
+    }
+
+    job.cleanupAt = Date.now() + delayMs
+    job.cleanupTimer = setTimeout(() => {
+        cleanupJob(job)
+    }, delayMs)
+    job.cleanupTimer.unref?.()
+}
+
+function touchJob(job) {
+    job.lastAccessedAt = Date.now()
+    scheduleJobCleanup(job)
 }
 
 function startJob(job) {
@@ -137,12 +173,30 @@ function startJob(job) {
 
     const child = spawn('yt-dlp', args, { windowsHide: true })
 
+    let phaseDetected = false // Track when we detect phase 2
+
     const onChunk = (chunk) => {
         const text = chunk.toString()
         const percent = parsePercent(text)
 
         if (percent !== null) {
-            job.serverProgress = percent
+            let scaledProgress = percent
+
+            // Detect phase 2 (when progress resets/decreases)
+            if (percent < job.serverProgress) {
+                phaseDetected = true
+            }
+
+            if (!phaseDetected) {
+                // Phase 1: scale 0-100 to 0-50
+                scaledProgress = (percent / 100) * 50
+            } else {
+                // Phase 2: scale 0-100 to 50-100
+                scaledProgress = 50 + (percent / 100) * 50
+            }
+
+            job.serverProgress = Math.round(scaledProgress)
+            console.log(`[Job ${job.id}] Progress: ${job.serverProgress}% (raw: ${percent}%, phase: ${phaseDetected ? 2 : 1})`)
         }
     }
 
@@ -154,12 +208,15 @@ function startJob(job) {
         job.error = error?.code === 'ENOENT'
             ? 'yt-dlp is not installed. Install yt-dlp and make sure it is in PATH.'
             : String(error.message || error)
+        scheduleJobCleanup(job)
     })
 
     child.on('close', async (code) => {
         if (code === 0) {
             job.serverProgress = 100
             job.status = 'ready'
+            console.log(`[Job ${job.id}] Download complete!`)
+            scheduleJobCleanup(job)
             return
         }
 
@@ -171,6 +228,8 @@ function startJob(job) {
         } catch {
             // Ignore cleanup errors.
         }
+
+        scheduleJobCleanup(job)
     })
 }
 
@@ -234,13 +293,16 @@ app.post('/download/start', (req, res) => {
     }
 
     const job = createJob(rawUrl)
+    console.log(`[Job ${job.id}] Created, starting download...`)
     startJob(job)
 
     res.status(202).json({
         jobId: job.id,
         status: job.status,
         serverProgress: job.serverProgress,
-        fileName: job.fileName
+        fileName: job.fileName,
+        downloadPath: `/download/file/${job.id}`,
+        expiresInMs: JOB_TTL_MS
     })
 })
 
@@ -261,7 +323,8 @@ app.get('/download/progress/:jobId', (req, res) => {
         res.write(`data: ${JSON.stringify({
             status: job.status,
             serverProgress: job.serverProgress,
-            error: job.error
+            error: job.error,
+            expiresAt: job.cleanupAt
         })}\n\n`)
     }
 
@@ -270,6 +333,10 @@ app.get('/download/progress/:jobId', (req, res) => {
 
     req.on('close', () => {
         clearInterval(timer)
+
+        if (job.status === 'ready' || job.status === 'failed') {
+            touchJob(job)
+        }
     })
 })
 
@@ -286,23 +353,42 @@ app.get('/download/file/:jobId', async (req, res) => {
         return
     }
 
+    touchJob(job)
+
     try {
         await fsp.access(job.filePath, fs.constants.R_OK)
     } catch {
         job.status = 'failed'
         job.error = 'Downloaded file is missing'
+        scheduleJobCleanup(job)
         res.status(500).json({ error: 'Downloaded file is missing' })
         return
     }
 
-    res.download(job.filePath, job.fileName, async () => {
-        try {
-            await fsp.unlink(job.filePath)
-        } catch {
-            // Ignore cleanup errors.
+    // Refresh TTL on each data chunk to handle slow downloads
+    let lastTouchTime = Date.now()
+    const touchInterval = setInterval(() => {
+        if (Date.now() - lastTouchTime > 30000) {
+            touchJob(job)
+            lastTouchTime = Date.now()
+        }
+    }, 10000)
+
+    req.on('close', () => {
+        clearInterval(touchInterval)
+        touchJob(job)
+    })
+
+    res.download(job.filePath, job.fileName, (error) => {
+        clearInterval(touchInterval)
+        if (error) {
+            // Keep job available for a retry instead of deleting immediately.
+            touchJob(job)
+            return
         }
 
-        jobs.delete(job.id)
+        // Keep temp file available briefly for manual re-downloads, then clean up.
+        touchJob(job)
     })
 })
 
@@ -316,3 +402,24 @@ app.post('/download', handleDownload)
 app.listen(port, host, () => {
     console.log(`Example app listening on ${host}:${port}`)
 })
+
+// Graceful shutdown: clean up all temp files
+async function gracefulShutdown() {
+    console.log('\n[Shutdown] Cleaning up temp files...')
+    const cleanupPromises = []
+
+    for (const job of jobs.values()) {
+        cleanupPromises.push(
+            fsp.unlink(job.filePath)
+                .then(() => console.log(`[Cleanup] Deleted ${job.filePath}`))
+                .catch((err) => console.log(`[Cleanup] Failed to delete ${job.filePath}: ${err.message}`))
+        )
+    }
+
+    await Promise.all(cleanupPromises)
+    console.log('[Shutdown] Done. Exiting.')
+    process.exit(0)
+}
+
+process.on('SIGINT', gracefulShutdown)
+process.on('SIGTERM', gracefulShutdown)

@@ -1,12 +1,14 @@
 import { useState } from 'react'
 import './App.css'
 
+const API_BASE = 'http://192.168.100.97:3000'
+
 function App() {
   const [url, setUrl] = useState('')
   const [status, setStatus] = useState('idle')
   const [message, setMessage] = useState('')
+  const [downloadUrl, setDownloadUrl] = useState('')
   const [serverProgress, setServerProgress] = useState(0)
-  const [clientProgress, setClientProgress] = useState(0)
 
   // async function onPasteClick() {
   //   if (!navigator.clipboard?.readText) {
@@ -45,31 +47,33 @@ function App() {
     try {
       setStatus('loading')
       setMessage('Server download started...')
+      setDownloadUrl('')
       setServerProgress(0)
-      setClientProgress(0)
 
-      const startResponse = await fetch('http://192.168.100.97:3000/download/start', {
+      const startResponse = await fetch(`${API_BASE}/download/start`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({ url: url.trim() })
       })
-
       if (!startResponse.ok) {
         const payload = await startResponse.json().catch(() => ({}))
         throw new Error(payload?.error || payload?.detail || 'Failed to start download job.')
       }
 
       const startPayload = await startResponse.json()
-      const { jobId, fileName } = startPayload
+      const { jobId, downloadPath } = startPayload
+      console.log(`[Frontend] Started job ${jobId}`)
 
       await new Promise((resolve, reject) => {
-        const progressSource = new EventSource(`http://192.168.100.97:3000/download/progress/${jobId}`)
+        const progressSource = new EventSource(`${API_BASE}/download/progress/${jobId}`)
+        console.log(`[Frontend] Opened EventSource for ${jobId}`)
 
         progressSource.onmessage = (event) => {
           const data = JSON.parse(event.data)
           const nextProgress = Math.round(Number(data.serverProgress || 0))
+          // console.log(`[Frontend] Progress: ${nextProgress}%, Status: ${data.status}`)
           setServerProgress(nextProgress)
 
           if (data.status === 'failed') {
@@ -79,6 +83,7 @@ function App() {
           }
 
           if (data.status === 'ready') {
+            console.log(`[Frontend] Download ready, closing EventSource`)
             setServerProgress(100)
             progressSource.close()
             resolve()
@@ -91,71 +96,25 @@ function App() {
         }
       })
 
-      setMessage('Server download complete. Sending file to browser...')
+      setMessage('Server download complete. Your link is ready.')
 
-      const response = await fetch(`http://192.168.100.97:3000/download/file/${jobId}`)
+      const resolvedDownloadUrl = downloadPath
+        ? `${API_BASE}${downloadPath}`
+        : `${API_BASE}/download/file/${jobId}`
 
-      if (!response.ok) {
-        let errorText = 'Download failed.'
+      setDownloadUrl(resolvedDownloadUrl)
 
-        try {
-          const payload = await response.json()
-          errorText = payload?.error || payload?.detail || errorText
-        } catch {
-          // Ignore JSON parse failures and keep fallback message.
-        }
-
-        throw new Error(errorText)
-      }
-
-      const totalBytes = Number.parseInt(response.headers.get('content-length') || '0', 10)
-      const reader = response.body?.getReader()
-
-      if (!reader) {
-        throw new Error('Readable response stream is not available in this browser.')
-      }
-
-      const chunks = []
-      let receivedBytes = 0
-
-      while (true) {
-        const { done, value } = await reader.read()
-
-        if (done) {
-          break
-        }
-
-        chunks.push(value)
-        receivedBytes += value.length
-
-        if (totalBytes > 0) {
-          const percent = Math.round((receivedBytes / totalBytes) * 100)
-          setClientProgress(Math.max(0, Math.min(100, percent)))
-        }
-      }
-
-      const blob = new Blob(chunks, {
-        type: response.headers.get('content-type') || 'video/mp4'
-      })
-
-      setClientProgress(100)
-      const disposition = response.headers.get('content-disposition') || ''
-      const nameMatch = disposition.match(/filename="?([^";]+)"?/) || []
-      const resolvedFileName = fileName || nameMatch[1] || 'video.mp4'
-
-      const blobUrl = window.URL.createObjectURL(blob)
       const anchor = document.createElement('a')
-      anchor.href = blobUrl
-      anchor.download = resolvedFileName
+      anchor.href = resolvedDownloadUrl
       document.body.appendChild(anchor)
       anchor.click()
       anchor.remove()
-      window.URL.revokeObjectURL(blobUrl)
 
       setStatus('success')
-      setMessage('Download started in your browser.')
+      setMessage('Download started. You can reuse the direct link below for 5 minutes.')
     } catch (error) {
       setStatus('error')
+      setDownloadUrl('')
       setMessage(error.message || 'Download failed.')
     }
   }
@@ -193,6 +152,15 @@ function App() {
 
         <p className={`status ${status}`}>{message || 'Ready'}</p>
 
+        {downloadUrl ? (
+          <p className="status break-all success">
+            Direct link:{' '}
+            <a href={downloadUrl} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all', overflowWrap: 'break-word' }}>
+              {downloadUrl}
+            </a>
+          </p>
+        ) : null}
+
         <section className="progress-section" aria-live="polite">
           <div className="progress-row">
             <span>Server download</span>
@@ -200,14 +168,6 @@ function App() {
           </div>
           <div className="progress-track">
             <div className="progress-fill" style={{ width: `${serverProgress}%` }}></div>
-          </div>
-
-          <div className="progress-row">
-            <span>Browser download</span>
-            <strong>{clientProgress}%</strong>
-          </div>
-          <div className="progress-track">
-            <div className="progress-fill browser" style={{ width: `${clientProgress}%` }}></div>
           </div>
         </section>
       </section>
