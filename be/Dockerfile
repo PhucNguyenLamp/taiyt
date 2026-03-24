@@ -3,16 +3,18 @@ FROM node:20-bookworm-slim
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
-    && chmod +x /usr/local/bin/yt-dlp
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg python3 python3-pip \
+    && python3 -m pip install --no-cache-dir --break-system-packages --upgrade yt-dlp \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY . .
 
-EXPOSE 3000
+ENV HOST=0.0.0.0
+ENV PORT=3000
+
+EXPOSE ${PORT}
 
 CMD ["npm", "start"]

@@ -8,8 +8,8 @@ const crypto = require('crypto')
 const { spawn } = require('child_process')
 
 const app = express()
-const port = 3000
-const host = '0.0.0.0'
+const port = Number(process.env.PORT) || 3000
+const host = process.env.HOST || '0.0.0.0'
 
 app.use(cors({
     origin(origin, callback) {
@@ -41,30 +41,35 @@ const YT_HOSTS = new Set([
     'youtu.be'
 ])
 
-function isValidYouTubeUrl(value) {
-    try {
-        const parsed = new URL(value)
-        return YT_HOSTS.has(parsed.hostname.toLowerCase())
-    } catch {
-        return false
-    }
+// Prefer broadly compatible H.264 video + AAC audio in MP4 container.
+const YT_DLP_STRICT_FORMAT = 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[vcodec^=avc1][ext=mp4]/best[vcodec^=avc1]'
+// Fallback when strict AVC1 formats are unavailable for a specific video.
+const YT_DLP_FALLBACK_FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+const YT_DLP_BASE_ARGS = [
+    '--no-warnings',
+    '--no-playlist',
+    '--newline',
+    '--merge-output-format',
+    'mp4'
+]
+
+function buildYtDlpArgs(format, outputPath, url) {
+    return [
+        ...YT_DLP_BASE_ARGS,
+        '-f',
+        format,
+        '-o',
+        outputPath,
+        url
+    ]
 }
 
-function downloadWithYtDlp(url, outputPath) {
-    return new Promise((resolve, reject) => {
-        const args = [
-            '--no-warnings',
-            '--no-playlist',
-            '--newline',
-            '--merge-output-format',
-            'mp4',
-            '-f',
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
-            '-o',
-            outputPath,
-            url
-        ]
+function isFormatUnavailableError(stderr) {
+    return /requested format is not available/i.test(stderr || '')
+}
 
+function runYtDlp(args) {
+    return new Promise((resolve, reject) => {
         const child = spawn('yt-dlp', args, { windowsHide: true })
         let stderr = ''
 
@@ -82,8 +87,33 @@ function downloadWithYtDlp(url, outputPath) {
                 return
             }
 
-            reject(new Error(stderr || `yt-dlp failed with exit code ${code}`))
+            const error = new Error(stderr || `yt-dlp failed with exit code ${code}`)
+            error.code = code
+            error.stderr = stderr
+            reject(error)
         })
+    })
+}
+
+function isValidYouTubeUrl(value) {
+    try {
+        const parsed = new URL(value)
+        return YT_HOSTS.has(parsed.hostname.toLowerCase())
+    } catch {
+        return false
+    }
+}
+
+function downloadWithYtDlp(url, outputPath) {
+    const strictArgs = buildYtDlpArgs(YT_DLP_STRICT_FORMAT, outputPath, url)
+
+    return runYtDlp(strictArgs).catch((error) => {
+        if (!isFormatUnavailableError(error?.stderr)) {
+            throw error
+        }
+
+        const fallbackArgs = buildYtDlpArgs(YT_DLP_FALLBACK_FORMAT, outputPath, url)
+        return runYtDlp(fallbackArgs)
     })
 }
 
@@ -99,6 +129,15 @@ function parsePercent(text) {
     }
 
     return Math.max(0, Math.min(100, value))
+}
+
+function buildYtDlpErrorMessage(code, stderr) {
+    const cleanStderr = String(stderr || '').trim()
+    if (cleanStderr) {
+        return cleanStderr
+    }
+
+    return `yt-dlp failed with exit code ${code}`
 }
 
 function createJob(url) {
@@ -158,79 +197,82 @@ function touchJob(job) {
 function startJob(job) {
     job.status = 'downloading'
 
-    const args = [
-        '--no-warnings',
-        '--no-playlist',
-        '--newline',
-        '--merge-output-format',
-        'mp4',
-        '-f',
-        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
-        '-o',
-        job.filePath,
-        job.url
-    ]
+    const runWithFormat = (format, isFallback = false) => {
+        const args = buildYtDlpArgs(format, job.filePath, job.url)
+        const child = spawn('yt-dlp', args, { windowsHide: true })
+        let stderr = ''
 
-    const child = spawn('yt-dlp', args, { windowsHide: true })
+        let phaseDetected = false // Track when we detect phase 2
 
-    let phaseDetected = false // Track when we detect phase 2
+        const onChunk = (chunk) => {
+            const text = chunk.toString()
+            const percent = parsePercent(text)
 
-    const onChunk = (chunk) => {
-        const text = chunk.toString()
-        const percent = parsePercent(text)
+            if (percent !== null) {
+                let scaledProgress = percent
 
-        if (percent !== null) {
-            let scaledProgress = percent
+                // Detect phase 2 (when progress resets/decreases)
+                if (percent < job.serverProgress) {
+                    phaseDetected = true
+                }
 
-            // Detect phase 2 (when progress resets/decreases)
-            if (percent < job.serverProgress) {
-                phaseDetected = true
+                if (!phaseDetected) {
+                    // Phase 1: scale 0-100 to 0-50
+                    scaledProgress = (percent / 100) * 50
+                } else {
+                    // Phase 2: scale 0-100 to 50-100
+                    scaledProgress = 50 + (percent / 100) * 50
+                }
+
+                job.serverProgress = Math.round(scaledProgress)
+                console.log(`[Job ${job.id}] Progress: ${job.serverProgress}% (raw: ${percent}%, phase: ${phaseDetected ? 2 : 1})`)
             }
-
-            if (!phaseDetected) {
-                // Phase 1: scale 0-100 to 0-50
-                scaledProgress = (percent / 100) * 50
-            } else {
-                // Phase 2: scale 0-100 to 50-100
-                scaledProgress = 50 + (percent / 100) * 50
-            }
-
-            job.serverProgress = Math.round(scaledProgress)
-            console.log(`[Job ${job.id}] Progress: ${job.serverProgress}% (raw: ${percent}%, phase: ${phaseDetected ? 2 : 1})`)
         }
+
+        child.stdout.on('data', onChunk)
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString()
+            onChunk(chunk)
+        })
+
+        child.on('error', (error) => {
+            job.status = 'failed'
+            job.error = error?.code === 'ENOENT'
+                ? 'yt-dlp is not installed. Install yt-dlp and make sure it is in PATH.'
+                : String(error.message || error)
+            scheduleJobCleanup(job)
+        })
+
+        child.on('close', async (code) => {
+            if (code === 0) {
+                job.serverProgress = 100
+                job.status = 'ready'
+                console.log(`[Job ${job.id}] Download complete!`)
+                scheduleJobCleanup(job)
+                return
+            }
+
+            if (!isFallback && isFormatUnavailableError(stderr)) {
+                console.log(`[Job ${job.id}] Strict AVC1 format unavailable, retrying with MP4 fallback format...`)
+                runWithFormat(YT_DLP_FALLBACK_FORMAT, true)
+                return
+            }
+
+            job.status = 'failed'
+            job.error = buildYtDlpErrorMessage(code, stderr)
+            console.error(`[Job ${job.id}] yt-dlp failed (exit ${code}): ${job.error}`)
+
+            try {
+                await fsp.unlink(job.filePath)
+            } catch {
+                // Ignore cleanup errors.
+            }
+
+            scheduleJobCleanup(job)
+        })
     }
 
-    child.stdout.on('data', onChunk)
-    child.stderr.on('data', onChunk)
-
-    child.on('error', (error) => {
-        job.status = 'failed'
-        job.error = error?.code === 'ENOENT'
-            ? 'yt-dlp is not installed. Install yt-dlp and make sure it is in PATH.'
-            : String(error.message || error)
-        scheduleJobCleanup(job)
-    })
-
-    child.on('close', async (code) => {
-        if (code === 0) {
-            job.serverProgress = 100
-            job.status = 'ready'
-            console.log(`[Job ${job.id}] Download complete!`)
-            scheduleJobCleanup(job)
-            return
-        }
-
-        job.status = 'failed'
-        job.error = `yt-dlp failed with exit code ${code}`
-
-        try {
-            await fsp.unlink(job.filePath)
-        } catch {
-            // Ignore cleanup errors.
-        }
-
-        scheduleJobCleanup(job)
-    })
+    runWithFormat(YT_DLP_STRICT_FORMAT)
 }
 
 async function handleDownload(req, res) {

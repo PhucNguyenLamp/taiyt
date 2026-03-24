@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import './App.css'
 
-const API_BASE = 'http://192.168.100.97:3000'
+const API_PORT = import.meta.env.VITE_API_PORT || '3000'
+const API_BASE = import.meta.env.VITE_API_BASE?.trim()
+  || `${window.location.protocol}//${window.location.hostname}:${API_PORT}`
 
 function App() {
   const [url, setUrl] = useState('')
